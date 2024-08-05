@@ -1,0 +1,377 @@
+import os
+from langchain.document_loaders import TextLoader, DirectoryLoader, UnstructuredPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import openai
+import pinecone
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import Pinecone
+from langchain.chains import RetrievalQA
+from langchain import OpenAI
+import PyPDF2
+
+def generate_blog_topics(general_topic, knowledge_base_querytool):
+    # Generate blog topics using the GPT-3.5-turbo model and knowledge base as context.
+
+    prompt = f"generate a blog topic related to " \
+             f"{general_topic}. " + \
+             f"Only write the topic, do not give descriptions. Only generate a topic " \
+             f"that you have enough knowledge on and are confident that a " \
+             f"1400 word blog could be made from. " \
+             f"Use the following text as context for {general_topic}:" \
+             f"\n{knowledge_base_querytool.run(f'What is {general_topic}?')}"
+    message = [
+        {"role": "system",
+         "content": " you are a blog writer "
+                    "who writes blogs about insights into technology "
+                    "and software"},
+        {"role": "user",
+         "content": prompt}
+    ]
+    response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo-16k',
+        messages=message,
+        max_tokens=4000  # Adjust this based on the desired word count
+    )
+    text = response.choices[0].message['content']
+    return text.strip().split('\n')[0]
+
+
+def _format_outline(list_of_sections):
+    outline_list = []
+    string_sum = ''
+    for string in list_of_sections:
+        if string.strip() == '':
+            pass
+        elif string[0].isnumeric() or string[0] != ' ':
+            if string_sum != '':
+                outline_list.append(string_sum)
+            string_sum = string + '\n'
+        else:
+            string_sum += string + '\n'
+    outline_list.append(string_sum)
+    return outline_list
+
+
+def generate_outline(topic, knowledge_base, source_list):
+    print("Generating outline:")
+    similarities = agreements_disagreements(knowledge_base, topic, source_list)
+
+    # reformat the outline just in case it didnt format it correctly
+    message = [
+        {"role": "system",
+         "content": " you are a blog writer "
+                    "who writes blogs about insights into technology "
+                    "and software"},
+        {
+            "role": "user",
+            "content": f"create the outline of a blog post using a piece of text on the following Topic: {topic}\n\n" \
+                       f"you are only allowed to use the piece of text that I will give you. You "
+                       f"cannot add anything to the outline that isnt from the piece of text. "
+                       f"Do not make stuff up."
+                        "Do not write anything directly mentioning the sources. Do not write about"
+                        " Discrepancies in information. \n "
+                        f"Here is the piece of text:\n {similarities}\n"
+
+        }
+
+    ]
+
+    response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo-16k',
+        messages=message,
+        max_tokens=3000)
+    message.append({
+        "role": 'assistant',
+        "content": response.choices[0].message['content'].strip()
+    })
+    message.append({
+        "role": "user",
+        "content": "reformat the outline such that the headings are numbered "
+                   "and the subheadings are lettered. "
+                   "Also indent the subheadings. Do not add a note to the "
+                   "outline confirming that you reformatted it. "
+                   "Just write the reformatted outline. "
+                   "Do not write anything else."
+    })
+    reformated_response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo-16k',
+        messages=message,
+        max_tokens=3000
+
+    )
+
+    reformated_outline_text = reformated_response.choices[0].message[
+        'content'].strip()
+    outline_list = reformated_outline_text.strip().split('\n')
+
+    print(reformated_outline_text)
+    outline_list = _format_outline(outline_list)
+    return outline_list
+
+
+def generate_blog_post(general_topic, topic, outline, knowledge_base, source_list):
+    # Generate the essay using the outline and relevant knowledge base.
+
+    blog_post = ''
+    for section in outline:
+        section_title = section.split('\n')[0]
+        agreements = agreements_disagreements(knowledge_base,
+                                              f"{general_topic}: {section_title}", source_list)
+        print(f"Generating Section: {section_title}")
+        if section_title.split()[1].lower() != 'conclusion':
+            prompt = f"Create a 500 word paragraph that will be part of a blog " \
+                     f"post on the topic of {topic}. the section that you are " \
+                     f"writing is {section_title}. Do not make stuff up. Do not " + \
+                     f"refuse to write the paragraph. Do not write a conclusion or " \
+                     f"summary at the end of the paragraph. " \
+                     f"Make sure to add '{section_title}' " \
+                     f"to the top of the paragraph." \
+                     f" Use the following outline to write the paragraph:\n{section}" \
+                     f"\n\n Use the following text as context write the paragraph:" \
+                     f" \n{agreements['agreements']}"
+
+            section_message = [
+                {
+                    "role": "system",
+                    "content": " you are a blog writer "
+                               "who writes blogs about insights into technology "
+                               "and software"
+                },
+                {
+                    'role': 'user',
+                    "content": prompt
+
+                }
+
+            ]
+            section_text = openai.ChatCompletion.create(
+                model='gpt-3.5-turbo-16k',
+                messages=section_message,
+                max_tokens=3000  # Adjust this based on the desired word count
+            )
+
+            blog_post += section_text.choices[0].message[
+                             'content'].strip() + "\n"
+
+        else:
+            blog_post += "CONCLUSION\n"
+            conc_message = [
+                {"role": "system",
+                 "content": " you are a blog writer "
+                            "who writes blogs about insights into technology "
+                            "and software"},
+                {
+                    "role": "user",
+                    "content": f"Write a short conclusion for the following blog post:"
+                               f" {blog_post}"
+                }
+
+            ]
+            response = openai.ChatCompletion.create(
+                model='gpt-3.5-turbo-16k',
+                messages=conc_message,
+                max_tokens=3000  # Adjust this based on the desired word count
+            )
+            conclusion = response.choices[0].message['content'].strip()
+            blog_post += conclusion
+            break
+
+    return blog_post
+
+def pdf_to_text(pdf_path, output_path):
+    try:
+        with open(pdf_path, 'rb') as pdf_file:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ''
+            for page_num in range(len(pdf_reader.pages)):
+                text += pdf_reader.pages[page_num].extract_text()
+
+            with open(output_path, 'w', encoding='utf-8') as output_file:
+                output_file.write(text)
+
+            print(f"Converted {pdf_path} to {output_path}")
+    except Exception as e:
+        print(f"Error processing {pdf_path}: {e}")
+
+def convert_pdfs_in_directory(directory):
+    for filename in os.listdir(directory):
+        if filename.lower().endswith('.pdf'):
+            pdf_path = os.path.join(directory, filename)
+            txt_filename = filename.replace('.pdf', '.txt')
+            txt_path = os.path.join(directory, txt_filename)
+
+            if not os.path.exists(txt_path):
+                pdf_to_text(pdf_path, txt_path)
+                os.remove(pdf_path)
+                print(f"Deleted {pdf_path} after conversion")
+            else:
+                print(f"Skipping {pdf_path}, corresponding text file already exists")
+
+
+
+
+def reload_database():
+    index_name = "article-database"
+
+    # reload all data
+    path = "C:/Users/murda/Downloads/blogs_v2/blogs_v2/context_data"
+    convert_pdfs_in_directory(path)
+    loader = DirectoryLoader(
+        "C:/Users/murda/Downloads/blogs_v2/blogs_v2/context_data")
+    pages = loader.load_and_split()
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=2000,
+        chunk_overlap=200,
+        length_function=len
+    )
+    docs = text_splitter.split_documents(pages)
+    embeddings = OpenAIEmbeddings()
+
+    # create a new index
+    docsearch = Pinecone.from_documents(docs, embeddings, index_name=index_name)
+    return docsearch
+
+
+def agreements_disagreements(knowledge_base, topic, source_list):
+    """
+    Find the similarity and differences between sources:
+    """
+    prompt = f"what is {topic}?"
+    text_doc = knowledge_base.similarity_search(prompt)
+    text = f'SOURCE 1: {text_doc[0].metadata["source"]} \n\n'
+    for i, doc in enumerate(text_doc):
+        text += doc.page_content
+        if not doc.metadata['source'] in source_list:
+            source_list.append(doc.metadata['source'])
+        if not i + 1 == len(text_doc):
+            text += f'\n\nSOURCE {i + 1}: {doc.metadata["source"]} \n\n'
+    agent_prompt = f"""
+    do not use tools. I am going to input text that comes from {len(text_doc)} different sources 
+    that answer the question, "What is {topic}?". Each text is separated
+    by "SOURCE N", where N is the source number. your objective is to find where 
+    the texts agree with each other. Do not make anything up. Do not make anything up.
+    Only take information from the text.
+    Gather your findings into a 1000 word paragraph.
+    Here is an example of the formatting of an answer:
+    
+    Agreements:
+    *full paragraph of agreed upon information.*
+    *end of example*
+    
+    
+    Here is the text: \n{text}
+    """
+    message = [
+        {"role": "system",
+         "content": " you are a blog writer "
+                    "who writes blogs about insights into technology "
+                    "and software"},
+        {
+            "role": "user",
+            "content": agent_prompt
+        }
+
+    ]
+    response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo-16k',
+        messages=message,
+        max_tokens=3000
+    )
+    message.append(
+        {"role": "assistant",
+         "content": response.choices[0].message['content'].strip()})
+    message.append(
+        {"role": "user",
+         "content": "Remove all mention of the sources themselves. do not add anything like '(source n)' in the text."
+                    "Instead, The paragraphs should describe the information itself, without mentioning that it is"
+                    "information that were collected by looking at what sources agree on."}
+    )
+    response = openai.ChatCompletion.create(
+        model='gpt-3.5-turbo-16k',
+        messages=message,
+        max_tokens=3000
+    )
+
+    text = response.choices[0].message['content'].strip().split('\n')
+
+    # text_sum = ''
+    # i = 0
+    # curr_text = ''
+    # while i < len(text) and (
+    #         curr_text.strip().lower() != 'disagreements:' and
+    #         curr_text.strip().lower() != 'disagreement:'):
+    #     text_sum += curr_text + '\n'
+    #     i += 1
+    #     try:
+    #         curr_text = text[i].strip()
+    #     except IndexError:
+    #         print("Error occured parsing agreements and disagreements. Continuing with "
+    #               "both agreements and disagreements")
+    #         print(text)
+    #         return {{'agreements': text_sum, 'disagreements': 'unable to parse disagreements',
+    #                  'raw_documents': text_doc}}
+
+
+    return {'agreements': text, 'disagreements': 'null',
+            'raw_documents': text_doc}
+
+## STEP 1: load database and querying tool
+OPEN_API_KEY = ''
+openai.api_key = OPEN_API_KEY
+os.environ["OPENAI_API_KEY"] = OPEN_API_KEY
+pinecone.init(
+    api_key="8d82df78-a253-480e-9c2b-29c8b1ed62a4",  # find at app.pinecone.io
+    environment="gcp-starter"  # next to api key in console
+)
+reload_question = input("Do you want to reload the database? (Y/N): ")
+if reload_question == 'Y':
+    reload_database()
+
+
+database = Pinecone.from_existing_index('article-database', OpenAIEmbeddings())
+llm = OpenAI(temperature=0.6)
+qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff",
+                                 retriever=database.as_retriever(
+                                     search_kwargs={"k": 2}))
+sources = []
+
+
+general_topic = input("Enter the general topic: ")
+
+# STEP 2: Generate blog topics
+# blog_topic = generate_blog_topics(general_topic, qa)
+# print(f"topic: {blog_topic}")
+# regenerate_topic = input("Do you want to regenerate the topic? (Y/N): ")
+# while regenerate_topic == 'Y':
+#     blog_topic = generate_blog_topics(general_topic, qa)
+#     print(f"topic: {blog_topic}")
+#     regenerate_topic = input("Do you want to regenerate the topic? (Y/N): ")
+
+
+blog_topic = f"A Deep Dive into {general_topic}"
+
+# STEP 3: generate the blog post
+print(f"\nGenerating Blog with Topic: {blog_topic}...")
+# Generate the outline
+outline = generate_outline(blog_topic, database, sources)
+ouline_question = input("\nWould you like to regenerate the outline? (Y/N) ")
+while ouline_question.upper() == 'Y':
+    outline = generate_outline(blog_topic, database, sources)
+    ouline_question = input("\nWould you like to regenerate the outline? (Y/N) ")
+
+# Generate blog post using the outline and knowledge
+blog_post = generate_blog_post(general_topic, blog_topic, outline, database, sources)
+
+# format sources and add to the end of the blog
+source_string = '\nFor more information, visit these websites:\n'
+for source in sources:
+    website = source.split('/')[-1].split('.')
+    website.remove('txt')
+    source_string += '.'.join(website) + '\n'
+
+blog_post += source_string
+# Save the blog post as a text file
+with open(f"{blog_topic}_blog_post.txt", "w") as file:
+    file.write(blog_post)
+
+print("Blog post generated and saved as text file.")
