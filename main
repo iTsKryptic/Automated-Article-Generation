@@ -320,7 +320,7 @@ OPEN_API_KEY = ''
 openai.api_key = OPEN_API_KEY
 os.environ["OPENAI_API_KEY"] = OPEN_API_KEY
 pinecone.init(
-    api_key="8d82df78-a253-480e-9c2b-29c8b1ed62a4",  # find at app.pinecone.io
+    api_key="",  # find at app.pinecone.io
     environment="gcp-starter"  # next to api key in console
 )
 reload_question = input("Do you want to reload the database? (Y/N): ")
