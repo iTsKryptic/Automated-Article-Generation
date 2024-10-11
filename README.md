@@ -1,6 +1,3 @@
-Here's a README file for your project:
-
----
 
 # Blog Post Generator
 
